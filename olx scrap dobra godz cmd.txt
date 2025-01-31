@@ -1,0 +1,158 @@
+# -*- coding: utf-8 -*-
+import time
+import json
+import telegram
+import asyncio
+from datetime import datetime, timedelta
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+import re  
+
+# Ustawienia bota Telegram
+telegram_token = "8018749861:AAF1a7oOCgdsXbtC9LowYyXW788pdccRRJI"
+chat_id = "7843601710"
+bot = telegram.Bot(token=telegram_token)
+
+# Lista wysłanych ofert (do unikania duplikatów)
+sent_offers = set()
+
+# Funkcja wysyłania wiadomości na Telegram
+async def send_telegram_message(message):
+    try:
+        await bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML", disable_web_page_preview=True)
+        print(f"✅ Wysłano: {message}")
+    except Exception as e:
+        print(f"❌ Błąd wysyłania: {e}")
+
+# Konfiguracja Selenium
+chrome_options = Options()
+chrome_options.add_argument("--headless")
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+chrome_options.add_argument("--incognito")
+chrome_options.add_argument("--disable-extensions")
+chrome_options.add_argument("--disable-cache")
+chrome_options.add_argument(
+    "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+)
+
+# Inicjalizacja przeglądarki
+driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=chrome_options)
+
+# Funkcja sprawdzająca wysyłkę OLX na podstawie JSON lub frazy "z Pakietem Ochronnym"
+def check_olx_shipping(offer):
+    try:
+        # 1️⃣ Sprawdzamy JSON oferty
+        json_data = offer.get_attribute("data-json")
+        if json_data:
+            data = json.loads(json_data)
+            delivery = data.get("delivery", {}).get("rock", {})
+            if delivery.get("active", False) and delivery.get("mode") == "BuyWithDelivery":
+                return "✅ Tak"
+
+        # 2️⃣ Szukamy frazy "z Pakietem Ochronnym" w cenie oferty
+        try:
+            price_elem = offer.find_element(By.XPATH, ".//span[contains(text(), 'z Pakietem Ochronnym')]")
+            if price_elem:
+                return "✅ Tak"
+        except:
+            pass
+
+    except Exception as e:
+        print(f"⚠️ Błąd sprawdzania wysyłki OLX: {e}")
+
+    return "❌ Nie"
+
+# Funkcja do scrapowania ofert OLX
+def scrape_olx():
+    print("\n🔍 Sprawdzam oferty OLX...")
+    try:
+        driver.get("https://www.olx.pl/elektronika/telefony/smartfony-telefony-komorkowe/iphone/q-iphone/?search[order]=created_at:desc")
+        driver.delete_all_cookies()
+        driver.refresh()
+        time.sleep(5)
+
+        # Pobranie ofert
+        offers = driver.find_elements(By.CSS_SELECTOR, 'div[data-testid="l-card"]')
+        print(f"📌 Znaleziono {len(offers)} ofert.")
+
+        now = datetime.now()
+        recent_offers = []
+
+        for offer in offers:
+            try:
+                title_elem = offer.find_element(By.CSS_SELECTOR, 'h4.css-1sq4ur2')
+                title = title_elem.text.strip()
+
+                link_elem = offer.find_element(By.CSS_SELECTOR, 'a.css-qo0cxu')
+                link = link_elem.get_attribute('href')
+                if not link.startswith("https://"):
+                    link = "https://www.olx.pl" + link
+
+                price_elem = offer.find_element(By.CSS_SELECTOR, 'p[data-testid="ad-price"]')
+                price = price_elem.text.strip() if price_elem else "Brak ceny"
+
+                date_elem = offer.find_element(By.CSS_SELECTOR, 'p[data-testid="location-date"]')
+                date_text = date_elem.text.strip() if date_elem else "Nieznana data"
+                date_text = date_text.replace("Odświeżono ", "")
+
+                # Pobranie statusu wysyłki OLX
+                shipping_status = check_olx_shipping(offer)
+
+                date_match = re.search(r"(Dzisiaj o \d{2}:\d{2})", date_text)
+                if date_match:
+                    date_text = date_match.group(1)
+
+                is_recent = False
+                offer_datetime = None  
+
+                if "Dzisiaj o" in date_text:
+                    try:
+                        offer_time = datetime.strptime(date_text.replace("Dzisiaj o ", ""), "%H:%M").time()
+                        offer_datetime = datetime.combine(now.date(), offer_time)
+                        time_diff = now - offer_datetime
+                        if timedelta(minutes=0) <= time_diff <= timedelta(hours=2):
+                            is_recent = True
+                    except Exception as e:
+                        print(f"⚠️ Błąd parsowania godziny: {date_text} -> {e}")
+
+                elif re.search(r"\d{1,2} \w+ \d{4}", date_text):
+                    is_recent = False  
+
+                if is_recent and link not in sent_offers:
+                    recent_offers.append((offer_datetime, title, price, date_text, link, shipping_status))
+
+            except Exception as e:
+                print(f"❌ Błąd przy przetwarzaniu oferty: {e}")
+
+        recent_offers.sort(key=lambda x: x[0])  # Najpierw najstarsze, by Telegram miał właściwą kolejność
+
+        for offer in recent_offers:
+            _, title, price, date_text, link, shipping_status = offer
+            message = (
+                f"📢 <b>Nowa oferta:</b> <a href='{link}'>{title}</a>\n"
+                f"💰 <b>Cena:</b> {price}\n"
+                f"📍 <b>Data:</b> {date_text}\n"
+                f"🚚 <b>Wysyłka OLX:</b> {shipping_status}\n"
+            )
+            sent_offers.add(link)
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(send_telegram_message(message))
+
+    except Exception as e:
+        print(f"❌ Błąd przy scrapowaniu: {e}")
+
+# Główna pętla
+def main():
+    while True:
+        scrape_olx()
+        time.sleep(60)
+
+# Uruchomienie skryptu
+if __name__ == "__main__":
+    print("🚀 Skrypt uruchomiony...")
+    main()
